@@ -18,15 +18,17 @@ import (
 )
 
 type Sync struct {
-	URI         string
-	Client      Client
-	Cron        Cron
-	LastBodySHA string
-	Logger      *logger.Logger
-	BearerToken string
-	AuthHeader  string
-	Interval    uint32
-	ready       bool
+	URI            string
+	Client         Client
+	Cron           Cron
+	lastBodySHA    string
+	lastETag       string
+	configModified bool
+	Logger         *logger.Logger
+	BearerToken    string
+	AuthHeader     string
+	Interval       uint32
+	ready          bool
 }
 
 // Client defines the behaviour required of a http client
@@ -42,7 +44,7 @@ type Cron interface {
 }
 
 func (hs *Sync) ReSync(ctx context.Context, dataSync chan<- sync.DataSync) error {
-	msg, err := hs.Fetch(ctx)
+	msg, err := hs.fetch(ctx)
 	if err != nil {
 		return err
 	}
@@ -63,48 +65,30 @@ func (hs *Sync) IsReady() bool {
 
 func (hs *Sync) Sync(ctx context.Context, dataSync chan<- sync.DataSync) error {
 	// Initial fetch
-	fetch, err := hs.Fetch(ctx)
+	fetch, err := hs.fetch(ctx)
 	if err != nil {
 		return err
 	}
 
 	// Set ready state
 	hs.ready = true
-
 	hs.Logger.Debug(fmt.Sprintf("polling %s every %d seconds", hs.URI, hs.Interval))
 	_ = hs.Cron.AddFunc(fmt.Sprintf("*/%d * * * *", hs.Interval), func() {
 		hs.Logger.Debug(fmt.Sprintf("fetching configuration from %s", hs.URI))
-		body, err := hs.fetchBodyFromURL(ctx, hs.URI)
+		body, err := hs.fetch(ctx)
 		if err != nil {
 			hs.Logger.Error(err.Error())
 			return
 		}
 
 		if body == "" {
-			hs.Logger.Debug("configuration deleted")
-		} else {
-			if hs.LastBodySHA == "" {
-				hs.Logger.Debug("new configuration created")
-				msg, err := hs.Fetch(ctx)
-				if err != nil {
-					hs.Logger.Error(fmt.Sprintf("error fetching: %s", err.Error()))
-				} else {
-					dataSync <- sync.DataSync{FlagData: msg, Source: hs.URI, Type: sync.ALL}
-				}
-			} else {
-				currentSHA := hs.generateSha([]byte(body))
-				if hs.LastBodySHA != currentSHA {
-					hs.Logger.Debug("configuration modified")
-					msg, err := hs.Fetch(ctx)
-					if err != nil {
-						hs.Logger.Error(fmt.Sprintf("error fetching: %s", err.Error()))
-					} else {
-						dataSync <- sync.DataSync{FlagData: msg, Source: hs.URI, Type: sync.ALL}
-					}
-				}
+			hs.Logger.Debug("empty body: configuration deleted or not modified")
+			return
+		}
 
-				hs.LastBodySHA = currentSHA
-			}
+		if hs.configModified {
+			hs.Logger.Debug("configuration modified")
+			dataSync <- sync.DataSync{FlagData: body, Source: hs.URI, Type: sync.ALL}
 		}
 	})
 
@@ -127,6 +111,11 @@ func (hs *Sync) fetchBodyFromURL(ctx context.Context, url string) (string, error
 	req.Header.Add("Accept", "application/json")
 	req.Header.Add("Accept", "application/yaml")
 
+	// Add If-None-Match header if we have a previous ETag
+	if hs.lastETag != "" {
+		req.Header.Add("If-None-Match", hs.lastETag)
+	}
+
 	if hs.AuthHeader != "" {
 		req.Header.Set("Authorization", hs.AuthHeader)
 	} else if hs.BearerToken != "" {
@@ -138,6 +127,13 @@ func (hs *Sync) fetchBodyFromURL(ctx context.Context, url string) (string, error
 	if err != nil {
 		return "", fmt.Errorf("error calling endpoint %s: %w", url, err)
 	}
+
+	// Handle 304 Not Modified response
+	if resp.StatusCode == http.StatusNotModified {
+		hs.Logger.Debug("configuration not modified (304 Not Modified)")
+		return "", nil
+	}
+
 	defer func() {
 		err = resp.Body.Close()
 		if err != nil {
@@ -148,6 +144,15 @@ func (hs *Sync) fetchBodyFromURL(ctx context.Context, url string) (string, error
 	statusOK := resp.StatusCode >= 200 && resp.StatusCode < 300
 	if !statusOK {
 		return "", fmt.Errorf("error fetching from url %s: %s", url, resp.Status)
+	}
+
+	// Store ETag from response if present
+	if etag := resp.Header.Get("ETag"); etag != "" {
+		hs.lastETag = etag
+	}
+
+	if resp.Body == nil {
+		return "", fmt.Errorf("empty response body from url %s", url)
 	}
 
 	body, err := io.ReadAll(resp.Body)
@@ -178,18 +183,26 @@ func (hs *Sync) generateSha(body []byte) string {
 	return base64.URLEncoding.EncodeToString(hasher.Sum(nil))
 }
 
-func (hs *Sync) Fetch(ctx context.Context) (string, error) {
+func (hs *Sync) fetch(ctx context.Context) (string, error) {
 	if hs.URI == "" {
 		return "", errors.New("no HTTP URL string set")
 	}
 
+	hs.configModified = false
 	body, err := hs.fetchBodyFromURL(ctx, hs.URI)
 	if err != nil {
 		return "", err
 	}
-	if body != "" {
-		hs.LastBodySHA = hs.generateSha([]byte(body))
+
+	// If body is empty, it means we received a 304 Not Modified
+	if body == "" {
+		return "", nil
 	}
 
+	bodySHA := hs.generateSha([]byte(body))
+	if bodySHA != hs.lastBodySHA {
+		hs.configModified = true
+		hs.lastBodySHA = bodySHA
+	}
 	return body, nil
 }
